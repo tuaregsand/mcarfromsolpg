@@ -1,7 +1,7 @@
 ## MCar Vesting & Staking Contract - PRD
 
 **Version:** 1.1
-**Date:** 2024-07-25
+**Date:** 2025-04-15
 
 **1. Introduction & Goal**
 
@@ -199,7 +199,7 @@ This document outlines the requirements for the Solana smart contract governing 
 
 ---
 
-### Development Status & Next Steps (as of 2025-04-14)
+### Development Status & Next Steps (as of 2025-04-18)
 
 #### Prioritized Checklist
 

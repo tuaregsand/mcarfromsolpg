@@ -2,6 +2,8 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface};
 use solana_program::program::invoke_signed;
 use solana_program::system_instruction;
+// Removed optional Clockwork integration to avoid dependency conflicts
+// use crate::program::McarVesting; // Removed unused import
 
 declare_id!("8UDAtqgE7sK6a8QXhftxEumwoSegJhPwo8R41dZKrjz3"); // Replace with your actual program ID
 
@@ -26,11 +28,40 @@ pub mod mcar_vesting {
     ) -> Result<()> {
         // Removed checks for initial_unlock_percent and vesting_period_days
 
+        // Prevent re-initialization
+        let cfg = &ctx.accounts.config;
+        require!(cfg.admin == Pubkey::default(), ProgramError::AlreadyInitialized);
+        // Create the SOL treasury PDA via CPI
+        let treasury_bump = ctx.bumps.sol_treasury;
+        let treasury_seeds = &[
+            b"sol_treasury".as_ref(),
+            &[treasury_bump]
+        ];
+        let signer_seeds = &[&treasury_seeds[..]];
+
+        invoke_signed(
+            &system_instruction::create_account(
+                ctx.accounts.admin.key, // From/Payer
+                ctx.accounts.sol_treasury.key, // To/New account
+                Rent::get()?.minimum_balance(0), // Lamports for rent (system account needs 0 data space)
+                0, // Space
+                &System::id(), // Owner (System Program)
+            ),
+            &[
+                ctx.accounts.admin.to_account_info(),
+                ctx.accounts.sol_treasury.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            signer_seeds,
+        )?;
+
+        msg!("SOL Treasury PDA created: {}", ctx.accounts.sol_treasury.key());
+
         let config = &mut ctx.accounts.config;
         config.admin = ctx.accounts.admin.key(); // Set admin from signer
         config.token_mint = ctx.accounts.token_mint.key();
         config.vault_authority_bump = ctx.bumps.vault_authority;
-        config.sol_treasury_bump = ctx.bumps.sol_treasury;
+        config.sol_treasury_bump = treasury_bump; // Use the bump derived earlier
         config.staked_vault = ctx.accounts.staked_vault.key();
         config.reward_vault = ctx.accounts.reward_vault.key(); // Store reward vault key
         config.total_staked = 0;
@@ -38,6 +69,7 @@ pub mod mcar_vesting {
         // Removed initial_unlock_percent assignment
         // Removed vesting_period_seconds assignment
         config.yield_rate_bps = yield_rate_bps;
+        config.distribution_cursor = 0; // Initialize distribution cursor
 
         Ok(())
     }
@@ -132,6 +164,32 @@ pub mod mcar_vesting {
         );
         Ok(())
     }
+   /// Admin-only instruction to withdraw SOL from the treasury PDA (e.g., for test setups or emergency).
+   pub fn admin_withdraw_sol(ctx: Context<AdminWithdrawSol>, amount: u64) -> Result<()> {
+       // Ensure treasury has enough lamports to withdraw
+       let treasury_lamports = ctx.accounts.sol_treasury.lamports();
+       require!(
+           treasury_lamports >= amount,
+           ProgramError::InsufficientReflectionPool
+       );
+       // Transfer lamports from treasury PDA to admin
+       let seeds = &[b"sol_treasury".as_ref(), &[ctx.accounts.config.sol_treasury_bump]];
+       let signer_seeds = &[&seeds[..]];
+       invoke_signed(
+           &system_instruction::transfer(
+               ctx.accounts.sol_treasury.key,
+               ctx.accounts.admin.key,
+               amount,
+           ),
+           &[
+               ctx.accounts.sol_treasury.to_account_info(),
+               ctx.accounts.admin.to_account_info(),
+               ctx.accounts.system_program.to_account_info(),
+           ],
+           signer_seeds,
+       )?;
+       Ok(())
+   }
 
     /// Stakes MCOIN tokens, initiating or resetting the 7-day unlock period.
     pub fn stake(ctx: Context<Stake>, amount: u64) -> Result<()> {
@@ -351,6 +409,15 @@ pub mod mcar_vesting {
             ProgramError::InsufficientReflectionPool
         );
 
+        // --- Add Logging Here ---
+        msg!("Attempting SOL transfer:");
+        msg!("  Treasury PDA: {}", ctx.accounts.sol_treasury.key());
+        msg!("  User recipient: {}", ctx.accounts.user.key());
+        msg!("  Amount (lamports): {}", pending_reward_lamports);
+        msg!("  Treasury current balance: {}", treasury_lamports);
+        msg!("  Expected bump: {}", config.sol_treasury_bump);
+        // --- End Logging ---
+
         // Transfer SOL from treasury PDA to user
         let seeds = &[b"sol_treasury".as_ref(), &[config.sol_treasury_bump]];
         let signer_seeds = &[&seeds[..]];
@@ -374,8 +441,28 @@ pub mod mcar_vesting {
 
         Ok(())
     }
+
 }
 
+// --- Context for Admin Withdraw SOL ---
+#[derive(Accounts)]
+#[instruction(amount: u64)]
+pub struct AdminWithdrawSol<'info> {
+    /// Admin signer authorized in config
+    #[account(mut,
+        constraint = config.admin == admin.key() @ ProgramError::Unauthorized
+    )]
+    pub admin: Signer<'info>,
+    /// Global config PDA
+    #[account(mut, seeds = [b"config"], bump)]
+    pub config: Account<'info, GlobalConfig>,
+    /// CHECK: This is the SOL treasury PDA. The necessary checks (mutability,
+    /// seeds, bump) are performed by the #[account(...)] macro constraints.
+    /// We are manually transferring lamports from it.
+    #[account(mut, seeds = [b"sol_treasury"], bump = config.sol_treasury_bump)]
+    pub sol_treasury: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
+}
 // --- Accounts Structures ---
 
 #[account]
@@ -390,6 +477,7 @@ pub struct GlobalConfig {
     pub total_staked: u64,        // 8
     pub reflection_index: u128,   // 16
     pub yield_rate_bps: u16,      // 2
+    pub distribution_cursor: u64, // New field to track batch position
 } // Total: 32*4 + 1*2 + 8 + 16 + 2 = 128 + 2 + 8 + 16 + 2 = 156 bytes
 
 #[account]
@@ -488,11 +576,11 @@ pub struct Initialize<'info> {
     pub admin: Signer<'info>, // Changed payer to admin and made it signer
 
     #[account(
-        init,
+        init_if_needed,
         seeds = [b"config"],
         bump,
         payer = admin, // Admin pays for initialization
-        space = 8 + 156 + 4 // 8 discriminator + 156 struct size + 4 padding? Using 160
+        space = 8 + 164 // 8 discriminator + 164 struct size
     )]
     pub config: Box<Account<'info, GlobalConfig>>,
 
@@ -503,13 +591,11 @@ pub struct Initialize<'info> {
     )]
     pub vault_authority: AccountInfo<'info>,
 
-    /// CHECK: SOL treasury PDA
+    /// CHECK: SOL treasury PDA - To be created via CPI
     #[account(
-        init,
+        mut, // Mutable because we will fund it via CPI
         seeds = [b"sol_treasury"],
-        bump,
-        payer = admin, // Admin pays for initialization
-        space = 0 // Allocate zero space for a SOL-holding PDA
+        bump
     )]
     pub sol_treasury: AccountInfo<'info>,
 
@@ -739,6 +825,42 @@ pub struct ClaimReflections<'info> {
     pub system_program: Program<'info, System>, // Still needed for CPI transfer
 }
 
+#[cfg(feature = "clockwork")]
+#[derive(Accounts)]
+pub struct ScheduleReflectionDistribution<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: Clockwork thread PDA
+    #[account(mut)]
+    pub thread: UncheckedAccount<'info>,
+
+    #[account(seeds = [b"config"], bump)]
+    pub config: Account<'info, GlobalConfig>,
+
+    /// CHECK: SOL treasury PDA
+    #[account(mut, seeds = [b"sol_treasury"], bump = config.sol_treasury_bump)]
+    pub sol_treasury: UncheckedAccount<'info>,
+
+    pub program: Program<'info, McarVesting>,
+    pub system_program: Program<'info, System>,
+}
+
+#[cfg(feature = "clockwork")]
+#[derive(Accounts)]
+pub struct DistributeReflections<'info> {
+    #[account(mut, seeds = [b"config"], bump)]
+    pub config: Account<'info, GlobalConfig>,
+
+    /// CHECK: SOL treasury PDA
+    #[account(mut, seeds = [b"sol_treasury"], bump = config.sol_treasury_bump)]
+    pub sol_treasury: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    pub remaining_accounts: Vec<AccountInfo<'info>>,
+}
+
 // --- Custom Errors ---
 
 #[error_code]
@@ -771,4 +893,57 @@ pub enum ProgramError {
     Unauthorized,
     #[msg("Total supply must be greater than zero for reflection calculation")] // New Error
     InvalidTotalSupply,
+    #[msg("Contract already initialized")]
+    AlreadyInitialized,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::prelude::Pubkey;
+
+    #[test]
+    fn test_calculate_unlocked_amount() {
+        let mut stake = UserStake::default();
+        stake.staked_amount = 100;
+        stake.start_timestamp = 0;
+        // No time elapsed => 0 unlocked
+        assert_eq!(stake.calculate_unlocked_amount(0).unwrap(), 0);
+        // After 1 day => 10% of 100
+        let one_day = SECONDS_IN_DAY;
+        assert_eq!(stake.calculate_unlocked_amount(one_day).unwrap(), 10);
+        // After 3 days => 30% of 100
+        let three_days = 3 * SECONDS_IN_DAY;
+        assert_eq!(stake.calculate_unlocked_amount(three_days).unwrap(), 30);
+        // After 8 days => capped at 100% => 100
+        let eight_days = 8 * SECONDS_IN_DAY;
+        assert_eq!(stake.calculate_unlocked_amount(eight_days).unwrap(), 100);
+    }
+
+    #[test]
+    fn test_calculate_yield() {
+        let mut stake = UserStake::default();
+        stake.staked_amount = 100;
+        stake.last_yield_claim_time = 0;
+        // Construct config with 10% APR (1000 bps)
+        let config = GlobalConfig {
+            admin: Pubkey::default(),
+            token_mint: Pubkey::default(),
+            vault_authority_bump: 0,
+            sol_treasury_bump: 0,
+            staked_vault: Pubkey::default(),
+            reward_vault: Pubkey::default(),
+            total_staked: 0,
+            reflection_index: 0,
+            yield_rate_bps: 1000, // 10% APR
+            distribution_cursor: 0,
+        };
+        // One full year elapsed
+        let seconds_per_year = 365u64 * 24 * 60 * 60;
+        let y = stake.calculate_yield(&config, seconds_per_year as i64).unwrap();
+        // 100 tokens * 10% = 10 tokens
+        assert_eq!(y, 10);
+        // Zero or negative elapsed => zero yield
+        assert_eq!(stake.calculate_yield(&config, 0).unwrap(), 0);
+    }
 }

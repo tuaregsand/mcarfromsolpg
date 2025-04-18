@@ -1,0 +1,9 @@
+[2025-04-17T14:51:24.474047000Z INFO  solana_test_validator] solana-validator 1.18.11 (src:c78a9720; feat:3469865029, client:SolanaLabs)
+[2025-04-17T14:51:24.474085000Z INFO  solana_test_validator] Starting validator with: ArgsOs {
+        inner: [
+            "solana-test-validator",
+            "--reset",
+        ],
+    }
+[2025-04-17T14:51:24.474148000Z WARN  solana_perf] CUDA is disabled
+[2025-04-17T14:51:24.477398000Z ERROR solana_faucet::faucet] Faucet failed to start: Operation not permitted (os error 1)
